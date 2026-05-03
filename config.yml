@@ -1,0 +1,6 @@
+smb:
+  address: "//192.168.0.100/Xeon"
+  directory: "OMVshare/HFS/rover_theater"
+display:
+  screen: 1
+  fullscreen: true

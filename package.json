@@ -1,0 +1,15 @@
+{
+  "name": "theaterplayer",
+  "version": "1.0.0",
+  "description": "An mpv powered automatic media player. Mounts an smb folder and shuffles it's videos one after the other.",
+  "main": "player.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "js-yaml": "^4.1.1",
+    "samba-client": "^7.2.0"
+  }
+}
