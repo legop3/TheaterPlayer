@@ -1,28 +1,44 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { spawn, execFile } = require('child_process');
 const yaml = require('js-yaml');
 const SambaClient = require('samba-client');
 
 const TEMP_DIR = path.join(os.tmpdir(), 'theaterplayer');
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v']);
+const QUEUE_TARGET = 6;
+const REFILL_RETRY_MS = 5000;
 
 function loadConfig() {
-    console.log('loading config...');
     const configContents = fs.readFileSync('config.yml', 'utf-8');
-    const config = yaml.load(configContents);
-    console.log('config loaded!');
-    return config;
+    return yaml.load(configContents);
 }
 
 function isVideoFile(file) {
-    if (file.type !== 'N') return false;
-    return VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase());
+    return file.type === 'N' && VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase());
 }
 
 function chooseRandom(items) {
     return items[Math.floor(Math.random() * items.length)];
+}
+
+function getDurationSeconds(filePath) {
+    return new Promise((resolve) => {
+        execFile('ffprobe', [
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            filePath
+        ], (err, stdout) => {
+            if (err) return resolve(null);
+            const n = Number((stdout || '').trim());
+            resolve(Number.isFinite(n) ? Math.round(n) : null);
+        });
+    });
 }
 
 function playWithMpv(filePath, displayConfig) {
@@ -38,35 +54,143 @@ function playWithMpv(filePath, displayConfig) {
     });
 }
 
+function formatSeconds(totalSeconds) {
+    if (totalSeconds == null) return '--:--';
+    const s = Math.max(0, totalSeconds);
+    const mins = Math.floor(s / 60);
+    const secs = s % 60;
+    return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
 async function main() {
     const config = loadConfig();
+    const webPort = (config.web && config.web.port) || 3000;
     fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+    const app = express();
+    const server = http.createServer(app);
+    const io = new Server(server);
+    app.use(express.static(path.join(__dirname, 'public')));
+
+    const state = {
+        title: 'Nothing playing',
+        durationSeconds: null,
+        elapsedSeconds: null,
+        remainingSeconds: null,
+        durationLabel: '--:--',
+        elapsedLabel: '--:--',
+        remainingLabel: '--:--',
+        progressLabel: '--:--/--:--',
+        queue: [],
+        status: 'starting'
+    };
+
+    function broadcastState() {
+        state.durationLabel = formatSeconds(state.durationSeconds);
+        state.elapsedLabel = formatSeconds(state.elapsedSeconds);
+        state.remainingLabel = formatSeconds(state.remainingSeconds);
+        state.progressLabel = `${state.elapsedLabel}/${state.durationLabel}`;
+        io.emit('state', state);
+    }
+
+    io.on('connection', (socket) => {
+        socket.emit('state', state);
+    });
+
+    server.listen(webPort, () => {
+        console.log(`web ui: http://localhost:${webPort}`);
+    });
 
     const client = new SambaClient({
         address: config.smb.address,
         directory: config.smb.directory
     });
 
-    while (true) {
-        const remoteFiles = await client.list('*');
-        const videos = remoteFiles.filter(isVideoFile);
+    let allVideos = [];
+    const queue = [];
 
-        if (videos.length === 0) {
-            console.log('no videos found, retrying in 5s');
-            await new Promise((r) => setTimeout(r, 5000));
-            continue;
+    async function refreshVideos() {
+        const remoteFiles = await client.list('*');
+        allVideos = remoteFiles.filter(isVideoFile).map((f) => f.name);
+    }
+
+    async function refillQueue(currentName) {
+        if (allVideos.length === 0) await refreshVideos();
+        const blocked = new Set(queue);
+        if (currentName) blocked.add(currentName);
+
+        while (queue.length < QUEUE_TARGET) {
+            const candidates = allVideos.filter((name) => !blocked.has(name));
+            if (candidates.length === 0) break;
+            const picked = chooseRandom(candidates);
+            queue.push(picked);
+            blocked.add(picked);
         }
 
-        const picked = chooseRandom(videos);
-        const localPath = path.join(TEMP_DIR, picked.name);
+        state.queue = queue.slice();
+        broadcastState();
+    }
 
-        console.log(`playing: ${picked.name}`);
-        await client.getFile(picked.name, localPath);
-        await playWithMpv(localPath, config.display);
+    state.status = 'idle';
+    broadcastState();
 
+    while (true) {
         try {
-            fs.unlinkSync(localPath);
-        } catch (_) {}
+            await refreshVideos();
+            await refillQueue(null);
+
+            if (queue.length === 0) {
+                state.status = 'no videos found, retrying';
+                broadcastState();
+                await new Promise((r) => setTimeout(r, REFILL_RETRY_MS));
+                continue;
+            }
+
+            const nextName = queue.shift();
+            state.queue = queue.slice();
+            state.status = 'downloading';
+            state.title = nextName;
+            state.durationSeconds = null;
+            state.elapsedSeconds = null;
+            state.remainingSeconds = null;
+            broadcastState();
+
+            const localPath = path.join(TEMP_DIR, nextName);
+            await client.getFile(nextName, localPath);
+            await refillQueue(nextName);
+
+            state.durationSeconds = await getDurationSeconds(localPath);
+            state.elapsedSeconds = 0;
+            state.remainingSeconds = state.durationSeconds;
+            state.status = 'playing';
+            broadcastState();
+
+            const startedAt = Date.now();
+            const ticker = setInterval(() => {
+                if (state.durationSeconds == null) return;
+                const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+                state.elapsedSeconds = Math.min(elapsed, state.durationSeconds);
+                state.remainingSeconds = Math.max(0, state.durationSeconds - elapsed);
+                broadcastState();
+            }, 1000);
+
+            await playWithMpv(localPath, config.display);
+            clearInterval(ticker);
+
+            state.status = 'ended';
+            state.elapsedSeconds = state.durationSeconds;
+            state.remainingSeconds = 0;
+            broadcastState();
+
+            try {
+                fs.unlinkSync(localPath);
+            } catch (_) {}
+        } catch (e) {
+            state.status = `error: ${e.message}`;
+            broadcastState();
+            console.error(e);
+            await new Promise((r) => setTimeout(r, REFILL_RETRY_MS));
+        }
     }
 }
 
