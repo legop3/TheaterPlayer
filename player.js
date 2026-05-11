@@ -174,15 +174,15 @@ async function main() {
             await client.getFile(nextName, localPath);
             await refillQueue(nextName);
 
-            const codec = await getVideoCodec(localPath);
-            if (codec === 'av1') {
-                state.status = 'skipping av1';
-                broadcastState();
-                try {
-                    fs.unlinkSync(localPath);
-                } catch (_) {}
-                continue;
-            }
+            // const codec = await getVideoCodec(localPath);
+            // if (codec === 'av1') {
+            //     state.status = 'skipping av1';
+            //     broadcastState();
+            //     try {
+            //         fs.unlinkSync(localPath);
+            //     } catch (_) {}
+            //     continue;
+            // }
 
             state.durationSeconds = await getDurationSeconds(localPath);
             state.elapsedSeconds = 0;
