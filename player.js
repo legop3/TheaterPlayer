@@ -41,6 +41,21 @@ function getDurationSeconds(filePath) {
     });
 }
 
+function getVideoCodec(filePath) {
+    return new Promise((resolve) => {
+        execFile('ffprobe', [
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            filePath
+        ], (err, stdout) => {
+            if (err) return resolve(null);
+            resolve((stdout || '').trim().toLowerCase() || null);
+        });
+    });
+}
+
 function playWithMpv(filePath, displayConfig) {
     const args = [];
     if (displayConfig && displayConfig.fullscreen) args.push('--fs');
@@ -158,6 +173,16 @@ async function main() {
             const localPath = path.join(TEMP_DIR, nextName);
             await client.getFile(nextName, localPath);
             await refillQueue(nextName);
+
+            const codec = await getVideoCodec(localPath);
+            if (codec === 'av1') {
+                state.status = 'skipping av1';
+                broadcastState();
+                try {
+                    fs.unlinkSync(localPath);
+                } catch (_) {}
+                continue;
+            }
 
             state.durationSeconds = await getDurationSeconds(localPath);
             state.elapsedSeconds = 0;
