@@ -9,7 +9,7 @@ const yaml = require('js-yaml');
 const SambaClient = require('samba-client');
 const { startTheaterBot } = require('./theaterBot');
 
-const TEMP_DIR = path.join(os.tmpdir(), 'theaterplayer');
+const DEFAULT_CACHE_DIR = '/var/tmp/theaterplayer';
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v']);
 const QUEUE_TARGET = 6;
 const REFILL_RETRY_MS = 5000;
@@ -81,10 +81,10 @@ function formatSeconds(totalSeconds) {
     return `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
-function cleanupTempDir() {
+function cleanupTempDir(tempDir) {
     try {
-        for (const name of fs.readdirSync(TEMP_DIR)) {
-            const filePath = path.join(TEMP_DIR, name);
+        for (const name of fs.readdirSync(tempDir)) {
+            const filePath = path.join(tempDir, name);
             try {
                 fs.rmSync(filePath, { recursive: true, force: true });
             } catch (_) {}
@@ -95,7 +95,8 @@ function cleanupTempDir() {
 async function main() {
     const config = loadConfig();
     const webPort = (config.web && config.web.port) || 3000;
-    fs.mkdirSync(TEMP_DIR, { recursive: true });
+    const tempDir = (config.storage && config.storage.cacheDir) || DEFAULT_CACHE_DIR;
+    fs.mkdirSync(tempDir, { recursive: true });
 
     const app = express();
     const server = http.createServer(app);
@@ -199,8 +200,15 @@ async function main() {
             state.remainingSeconds = null;
             broadcastState();
 
-            const localPath = path.join(TEMP_DIR, nextName);
-            await client.getFile(nextName, localPath);
+            const localPath = path.join(tempDir, nextName);
+            try {
+                await client.getFile(nextName, localPath);
+            } catch (downloadError) {
+                try {
+                    fs.unlinkSync(localPath);
+                } catch (_) {}
+                throw downloadError;
+            }
             await refillQueue(nextName);
 
             // const codec = await getVideoCodec(localPath);
@@ -246,7 +254,7 @@ async function main() {
 
             completedPlays += 1;
             if (completedPlays % CLEANUP_EVERY_PLAYS === 0) {
-                cleanupTempDir();
+                cleanupTempDir(tempDir);
             }
         } catch (e) {
             state.status = `error: ${e.message}`;

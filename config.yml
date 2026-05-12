@@ -6,3 +6,5 @@ display:
   fullscreen: true
 bot:
   serverUrl: "http://192.168.0.86:8080"
+storage:
+  cacheDir: "/var/tmp/theaterplayer"
