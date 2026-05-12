@@ -34,7 +34,7 @@ function startTheaterBot(serverUrl, onSkip) {
 
     socket.on('chat:message', async (msg = {}) => {
         const text = String(msg.text || '').trim().toLowerCase();
-        if (text !== '!tskip') return;
+        if ((text !== '!tskip') || (text !== 'tsk')) return;
 
         const skipped = onSkip();
         try {
