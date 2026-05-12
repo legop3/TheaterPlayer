@@ -4,3 +4,5 @@ smb:
 display:
   screen: 1
   fullscreen: true
+bot:
+  serverUrl: "http://192.168.0.86:8080"

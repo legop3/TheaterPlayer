@@ -7,11 +7,13 @@ const { Server } = require('socket.io');
 const { spawn, execFile } = require('child_process');
 const yaml = require('js-yaml');
 const SambaClient = require('samba-client');
+const { startTheaterBot } = require('./theaterBot');
 
 const TEMP_DIR = path.join(os.tmpdir(), 'theaterplayer');
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v']);
 const QUEUE_TARGET = 6;
 const REFILL_RETRY_MS = 5000;
+const CLEANUP_EVERY_PLAYS = 5;
 
 function loadConfig() {
     const configContents = fs.readFileSync('config.yml', 'utf-8');
@@ -62,11 +64,13 @@ function playWithMpv(filePath, displayConfig) {
     if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
     args.push(filePath);
 
-    return new Promise((resolve, reject) => {
-        const proc = spawn('mpv', args, { stdio: 'inherit' });
+    const proc = spawn('mpv', args, { stdio: 'inherit' });
+    const done = new Promise((resolve, reject) => {
         proc.on('error', reject);
-        proc.on('close', () => resolve());
+        proc.on('close', (code, signal) => resolve({ code, signal }));
     });
+
+    return { proc, done };
 }
 
 function formatSeconds(totalSeconds) {
@@ -75,6 +79,17 @@ function formatSeconds(totalSeconds) {
     const mins = Math.floor(s / 60);
     const secs = s % 60;
     return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
+function cleanupTempDir() {
+    try {
+        for (const name of fs.readdirSync(TEMP_DIR)) {
+            const filePath = path.join(TEMP_DIR, name);
+            try {
+                fs.rmSync(filePath, { recursive: true, force: true });
+            } catch (_) {}
+        }
+    } catch (_) {}
 }
 
 async function main() {
@@ -121,8 +136,22 @@ async function main() {
         directory: config.smb.directory
     });
 
+    let currentMpvProcess = null;
+    function skipCurrentPlayback() {
+        if (!currentMpvProcess) return false;
+        try {
+            currentMpvProcess.kill('SIGTERM');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    startTheaterBot(config.bot && config.bot.serverUrl, skipCurrentPlayback);
+
     let allVideos = [];
     const queue = [];
+    let completedPlays = 0;
 
     async function refreshVideos() {
         const remoteFiles = await client.list('*');
@@ -199,10 +228,14 @@ async function main() {
                 broadcastState();
             }, 1000);
 
-            await playWithMpv(localPath, config.display);
+            const playback = playWithMpv(localPath, config.display);
+            currentMpvProcess = playback.proc;
+            const playResult = await playback.done;
+            currentMpvProcess = null;
             clearInterval(ticker);
 
-            state.status = 'ended';
+            if (playResult && playResult.signal === 'SIGTERM') state.status = 'skipped';
+            else state.status = 'ended';
             state.elapsedSeconds = state.durationSeconds;
             state.remainingSeconds = 0;
             broadcastState();
@@ -210,6 +243,11 @@ async function main() {
             try {
                 fs.unlinkSync(localPath);
             } catch (_) {}
+
+            completedPlays += 1;
+            if (completedPlays % CLEANUP_EVERY_PLAYS === 0) {
+                cleanupTempDir();
+            }
         } catch (e) {
             state.status = `error: ${e.message}`;
             broadcastState();
