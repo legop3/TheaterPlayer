@@ -62,6 +62,7 @@ function playWithMpv(filePath, displayConfig) {
     const args = [];
     if (displayConfig && displayConfig.fullscreen) args.push('--fs');
     if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
+    args.push('--af=dynaudnorm');
     args.push(filePath);
 
     const proc = spawn('mpv', args, { stdio: 'inherit' });
