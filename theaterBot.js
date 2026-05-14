@@ -33,9 +33,15 @@ function startTheaterBot(serverUrl, handlers = {}) {
         });
     }
 
+    const helpCommands = [
+        { command: '!help', description: 'Show available commands.' },
+        { command: '!skip or tsk', description: 'Skip the currently playing video.' },
+        { command: '!play <search text>', description: 'Find and play the best matching video.' }
+    ];
+
     socket.on('connect', async () => {
         try {
-            await emitAck('session:identify', { nickname: 'TheaterBot' });
+            await emitAck('session:identify', { nickname: 'Theater' });
             await emitAck('session:setRole', { role: 'spectator' });
             await emitAck('session:subscribeAll');
             // await emitAck('chat:send', { text: 'TheaterBot online. Use !tskip to skip current video.' });
@@ -49,15 +55,25 @@ function startTheaterBot(serverUrl, handlers = {}) {
         const text = textRaw.toLowerCase();
 
         try {
-            if (text === '!tskip' || text === 'tsk' || text === '!tsk') {
+            if (text === '!help') {
+                const helpText = helpCommands
+                    .map((c) => `${c.command} - ${c.description}`)
+                    .join('\n');
+                await sendBotMessage(helpText);
+                return;
+            }
+
+            if (text === '!skip' || text === '!tskip' || text === 'tsk' || text === '!tsk') {
                 const skipped = onSkip();
                 if (skipped) await sendBotMessage('Skipping!');
                 else await sendBotMessage('Nothing is currently playing.');
                 return;
             }
 
-            if (text.startsWith('!tfind ')) {
-                const query = textRaw.slice(7).trim();
+            if (text.startsWith('!play ') || text.startsWith('!tfind ')) {
+                const query = text.startsWith('!play ')
+                    ? textRaw.slice(6).trim()
+                    : textRaw.slice(7).trim();
                 const result = await onFindAndPlay(query);
                 if (result && result.ok) {
                     await sendBotMessage(`Playing: ${result.matched}`);
