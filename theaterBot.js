@@ -3,6 +3,7 @@ const { io } = require('socket.io-client');
 function startTheaterBot(serverUrl, handlers = {}) {
     const onSkip = handlers.onSkip || (() => false);
     const onFindAndPlay = handlers.onFindAndPlay || (async () => ({ ok: false, message: 'Search unavailable.' }));
+    const profileImage = handlers.profileImage || '';
 
     if (!serverUrl) {
         console.log('theater bot disabled: no server url configured');
@@ -24,6 +25,14 @@ function startTheaterBot(serverUrl, handlers = {}) {
         });
     }
 
+    function sendBotMessage(text) {
+        return emitAck('chat:send', {
+            text,
+            bot: true,
+            profileImage
+        });
+    }
+
     socket.on('connect', async () => {
         try {
             await emitAck('session:identify', { nickname: 'TheaterBot' });
@@ -42,8 +51,8 @@ function startTheaterBot(serverUrl, handlers = {}) {
         try {
             if (text === '!tskip' || text === 'tsk' || text === '!tsk') {
                 const skipped = onSkip();
-                if (skipped) await emitAck('chat:send', { text: 'Skipping!' });
-                else await emitAck('chat:send', { text: 'Nothing is currently playing.' });
+                if (skipped) await sendBotMessage('Skipping!');
+                else await sendBotMessage('Nothing is currently playing.');
                 return;
             }
 
@@ -51,9 +60,9 @@ function startTheaterBot(serverUrl, handlers = {}) {
                 const query = textRaw.slice(7).trim();
                 const result = await onFindAndPlay(query);
                 if (result && result.ok) {
-                    await emitAck('chat:send', { text: `Playing: ${result.matched}` });
+                    await sendBotMessage(`Playing: ${result.matched}`);
                 } else {
-                    await emitAck('chat:send', { text: result && result.message ? result.message : 'No match found.' });
+                    await sendBotMessage(result && result.message ? result.message : 'No match found.');
                 }
             }
         } catch (e) {

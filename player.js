@@ -75,7 +75,8 @@ async function main() {
 
     startTheaterBot(config.bot && config.bot.serverUrl, {
         onSkip: skipCurrentPlayback,
-        onFindAndPlay: findAndPlayByQuery
+        onFindAndPlay: findAndPlayByQuery,
+        profileImage: config.bot && config.bot.profileImage
     });
 
     state.status = 'idle';

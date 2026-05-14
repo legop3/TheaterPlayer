@@ -6,5 +6,6 @@ display:
   fullscreen: true
 bot:
   serverUrl: "http://192.168.0.86:8080"
+  profileImage: "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2f/Sala_de_cine.jpg/1920px-Sala_de_cine.jpg?utm_source=en.wikipedia.org&utm_campaign=parser&utm_content=thumbnail"
 storage:
   cacheDir: "/var/tmp/theaterplayer"
