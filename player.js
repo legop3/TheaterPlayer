@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 
 const { startTheaterBot } = require('./theaterBot');
 const { loadConfig } = require('./services/config');
-const { getDurationSeconds, playWithMpv, cleanupTempDir } = require('./services/playback');
+const { getDurationSeconds, playWithMpv } = require('./services/playback');
 const { createPlayerState, broadcastState } = require('./services/state');
 const { QueueManager } = require('./services/queueManager');
 const { MediaLibrary } = require('./services/mediaLibrary');
@@ -14,7 +14,6 @@ const { MediaLibrary } = require('./services/mediaLibrary');
 const DEFAULT_CACHE_DIR = '/var/tmp/theaterplayer';
 const QUEUE_TARGET = 6;
 const REFILL_RETRY_MS = 5000;
-const CLEANUP_EVERY_PLAYS = 5;
 
 async function main() {
     const config = loadConfig();
@@ -42,7 +41,6 @@ async function main() {
     const queueManager = new QueueManager(QUEUE_TARGET);
 
     let currentMpvProcess = null;
-    let completedPlays = 0;
 
     function skipCurrentPlayback() {
         if (!currentMpvProcess) return false;
@@ -105,7 +103,9 @@ async function main() {
 
             const localPath = path.join(tempDir, nextName);
             try {
-                await mediaLibrary.download(nextName, localPath);
+                const downloadResult = await mediaLibrary.download(nextName, localPath);
+                state.status = downloadResult.fromCache ? 'using cached file' : 'downloaded';
+                syncState();
             } catch (downloadError) {
                 try { fs.unlinkSync(localPath); } catch (_) {}
                 throw downloadError;
@@ -142,12 +142,6 @@ async function main() {
             state.remainingSeconds = 0;
             syncState();
 
-            try { fs.unlinkSync(localPath); } catch (_) {}
-
-            completedPlays += 1;
-            if (completedPlays % CLEANUP_EVERY_PLAYS === 0) {
-                cleanupTempDir(tempDir);
-            }
         } catch (e) {
             state.status = `error: ${e.message}`;
             syncState();

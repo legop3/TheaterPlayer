@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const SambaClient = require('samba-client');
 const Fuse = require('fuse.js');
@@ -28,7 +29,15 @@ class MediaLibrary {
     }
 
     async download(name, localPath) {
+        try {
+            const stat = fs.statSync(localPath);
+            if (stat.isFile() && stat.size > 0) {
+                return { fromCache: true };
+            }
+        } catch (_) {}
+
         await this.client.getFile(name, localPath);
+        return { fromCache: false };
     }
 
     findBestMatch(query) {
