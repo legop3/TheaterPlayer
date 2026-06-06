@@ -21,6 +21,13 @@ function playWithMpv(filePath, displayConfig) {
     if (displayConfig && displayConfig.fullscreen) args.push('--fs');
     if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
     args.push('--af=loudnorm');
+
+    // Ask mpv itself to prefer English audio tracks before it applies its normal
+    // fallback behavior. This avoids trying to translate ffprobe stream indexes
+    // into mpv track ids, because mpv already understands the track metadata and
+    // is the final authority on which audio ids can actually be selected.
+    args.push('--alang=eng,en,english');
+
     args.push(filePath);
 
     const proc = spawn('mpv', args, { stdio: 'inherit' });
