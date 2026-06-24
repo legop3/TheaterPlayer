@@ -15,6 +15,34 @@ const DEFAULT_CACHE_DIR = '/var/tmp/theaterplayer';
 const QUEUE_TARGET = 6;
 const REFILL_RETRY_MS = 5000;
 
+function getLocalCachePath(cacheDir, remoteName) {
+    // Remote library names are SMB-relative paths such as "trailers/foo.mkv".
+    // Keeping that folder shape in the cache prevents collisions between files
+    // with the same basename in different SMB folders.
+    const cacheRoot = path.resolve(cacheDir);
+    const remoteParts = String(remoteName || '')
+        .split(/[\\/]+/)
+        .filter((part) => part && part !== '.');
+
+    // The SMB share is trusted for media, but its filenames still come from
+    // outside this process. Reject parent-directory segments so a weird or
+    // malicious remote name cannot escape the configured cache directory.
+    if (remoteParts.length === 0 || remoteParts.includes('..')) {
+        throw new Error(`invalid remote video path: ${remoteName}`);
+    }
+
+    const localPath = path.resolve(cacheRoot, ...remoteParts);
+
+    // Resolve-and-prefix checking is the last guard after segment validation.
+    // It keeps all cached downloads inside cacheRoot even if path behavior or
+    // future input normalization changes.
+    if (localPath !== cacheRoot && !localPath.startsWith(cacheRoot + path.sep)) {
+        throw new Error(`invalid cache path for remote video: ${remoteName}`);
+    }
+
+    return localPath;
+}
+
 async function main() {
     const config = loadConfig();
     const webPort = (config.web && config.web.port) || 3000;
@@ -102,8 +130,13 @@ async function main() {
             state.remainingSeconds = null;
             syncState();
 
-            const localPath = path.join(tempDir, nextName);
+            const localPath = getLocalCachePath(tempDir, nextName);
             try {
+                // Nested SMB videos map to nested cache paths. Ensure the local
+                // parent folder exists immediately before downloading so cache
+                // cleanup or a fresh machine cannot make samba-client.getFile()
+                // fail with a missing local directory.
+                fs.mkdirSync(path.dirname(localPath), { recursive: true });
                 const downloadResult = await mediaLibrary.download(nextName, localPath);
                 state.status = downloadResult.fromCache ? 'using cached file' : 'downloaded';
                 syncState();
