@@ -1,5 +1,12 @@
 const fs = require('fs');
+const path = require('path');
 const { spawn, execFile } = require('child_process');
+
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.opus', '.m4a', '.aac']);
+
+function isAudioFile(filePath) {
+    return AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
 
 function getDurationSeconds(filePath) {
     return new Promise((resolve) => {
@@ -21,6 +28,13 @@ function playWithMpv(filePath, displayConfig) {
     if (displayConfig && displayConfig.fullscreen) args.push('--fs');
     if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
     args.push('--af=loudnorm');
+
+    if (isAudioFile(filePath)) {
+        // Audio-only files need a video stream so the theater display has
+        // something intentional to show. The filter splits mpv's first audio
+        // stream into normal audio output and FFmpeg's showcqt visualizer output.
+        args.push('--lavfi-complex=[aid1]asplit[ao][a]; [a]showcqt[vo]');
+    }
 
     // Ask mpv itself to prefer English audio tracks before it applies its normal
     // fallback behavior. This avoids trying to translate ffprobe stream indexes

@@ -4,7 +4,21 @@ const { spawn } = require('child_process');
 const SambaClient = require('samba-client');
 const Fuse = require('fuse.js');
 
-const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v']);
+const MEDIA_EXTENSIONS = new Set([
+    '.mp4',
+    '.mkv',
+    '.mov',
+    '.avi',
+    '.webm',
+    '.m4v',
+    '.mp3',
+    '.flac',
+    '.wav',
+    '.ogg',
+    '.opus',
+    '.m4a',
+    '.aac'
+]);
 const TOP_LEVEL_SCAN_CONCURRENCY = 4;
 const DEFAULT_IGNORED_DIRECTORIES = new Set([
     '.hist',
@@ -23,11 +37,11 @@ function isDirectory(file) {
     return String(file.type || '').includes('D');
 }
 
-function isVideoFile(file) {
-    // Treat any non-directory entry with a known video extension as playable.
+function isMediaFile(file) {
+    // Treat any non-directory entry with a known media extension as playable.
     // SMB servers may report normal files as "N", "A", or another non-directory
     // attribute mix, so extension plus "not a directory" is the reliable filter.
-    return !isDirectory(file) && VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase());
+    return !isDirectory(file) && MEDIA_EXTENSIONS.has(path.extname(file.name).toLowerCase());
 }
 
 function normalizeSmbPath(smbPath) {
@@ -98,7 +112,7 @@ function parseRecursiveListing(output, baseDirectory) {
         if (!name || shouldSkipDirectory(name) || type.includes('D')) continue;
 
         const remotePath = joinRemotePath(currentDir, name);
-        if (VIDEO_EXTENSIONS.has(path.posix.extname(remotePath).toLowerCase())) {
+        if (MEDIA_EXTENSIONS.has(path.posix.extname(remotePath).toLowerCase())) {
             videos.push(remotePath);
         }
     }
@@ -202,7 +216,7 @@ class MediaLibrary {
                 continue;
             }
 
-            if (isVideoFile(file)) {
+            if (isMediaFile(file)) {
                 videos.push(file.name);
             }
         }
@@ -230,7 +244,7 @@ class MediaLibrary {
         // Scope recursion to one allowed top-level folder. smbclient still walks
         // that folder internally, but it never gets a chance to enter ignored
         // root metadata folders such as `.hist`.
-        const listCommands = Array.from(VIDEO_EXTENSIONS, (extension) => `ls *${extension}`);
+        const listCommands = Array.from(MEDIA_EXTENSIONS, (extension) => `ls *${extension}`);
         args.push('-c', ['recurse', ...listCommands].join(';'), this.smbConfig.address);
         return args;
     }
