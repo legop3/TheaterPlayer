@@ -1,45 +1,179 @@
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const SambaClient = require('samba-client');
 const Fuse = require('fuse.js');
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v']);
-const SMB_ROOT_PATTERN = '*';
-
-function isVideoFile(file) {
-    // smbclient reports file attributes as compact strings. Directories include
-    // "D", while normal files can be reported as "N" or with archive/hidden
-    // attributes depending on the server. Treat any non-directory entry with a
-    // video extension as playable so NAS-specific attributes do not hide videos.
-    return !isDirectory(file) && VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase());
-}
+const TOP_LEVEL_SCAN_CONCURRENCY = 4;
+const DEFAULT_IGNORED_DIRECTORIES = new Set([
+    '.hist',
+    '.history',
+    '.metadata',
+    '.thumbs',
+    '.thumbnails',
+    '@eadir'
+]);
+const MISSING_LISTING_PATTERN = /^NT_STATUS_(NO_SUCH_FILE|OBJECT_NAME_NOT_FOUND) listing /;
 
 function isDirectory(file) {
-    // The Samba wrapper exposes the raw smbclient attribute field as `type`.
-    // Checking for "D" is the important part because SMB folders can be "D",
-    // "DA", or another combination of attributes depending on the share.
+    // smbclient exposes SMB attribute letters as `type`. Directories include
+    // "D", sometimes mixed with other attributes, so checking for containment is
+    // safer than checking equality against one exact value.
     return String(file.type || '').includes('D');
 }
 
+function isVideoFile(file) {
+    // Treat any non-directory entry with a known video extension as playable.
+    // SMB servers may report normal files as "N", "A", or another non-directory
+    // attribute mix, so extension plus "not a directory" is the reliable filter.
+    return !isDirectory(file) && VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase());
+}
+
+function normalizeSmbPath(smbPath) {
+    // smbclient prints remote paths with backslashes because it follows SMB's
+    // Windows-style path syntax. The rest of this app stores forward-slash paths
+    // so search, UI display, local cache paths, and samba-client downloads all
+    // use one consistent representation.
+    return String(smbPath || '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+/, '')
+        .replace(/\/+$/, '');
+}
+
 function shouldSkipDirectory(name) {
-    // smbclient directory listings commonly include "." and "..". Recursing
-    // into either one would loop forever, so they are filtered before building
-    // child paths.
-    return name === '.' || name === '..';
+    // smbclient directory listings commonly include "." and "..". Recursing into
+    // either one would loop forever. The other defaults are metadata/cache
+    // folders that can contain thousands of irrelevant files and should never be
+    // searched for playable media.
+    return name === '.' || name === '..' || DEFAULT_IGNORED_DIRECTORIES.has(String(name).toLowerCase());
 }
 
 function joinRemotePath(parentPath, childName) {
-    // SMB commands in samba-client accept forward-slash paths and translate them
-    // to backslashes internally. path.posix keeps the saved library names stable
-    // on every OS and avoids Windows-style separators leaking into search/UI text.
-    return parentPath ? path.posix.join(parentPath, childName) : childName;
+    const normalizedParent = normalizeSmbPath(parentPath);
+    return normalizedParent ? path.posix.join(normalizedParent, childName) : childName;
+}
+
+function stripBaseDirectory(remoteDir, baseDirectory) {
+    const normalizedDir = normalizeSmbPath(remoteDir);
+    const normalizedBase = normalizeSmbPath(baseDirectory);
+
+    // With `-D`, smbclient can still print recursive directory markers as full
+    // paths such as "\OMVshare\HFS\rover_theater\movies". Downloads are issued
+    // relative to that same configured directory, so the library must strip the
+    // configured prefix and keep only "movies".
+    if (!normalizedBase) return normalizedDir;
+    if (normalizedDir === normalizedBase) return '';
+    if (normalizedDir.startsWith(normalizedBase + '/')) {
+        return normalizedDir.slice(normalizedBase.length + 1);
+    }
+
+    return normalizedDir;
+}
+
+function parseRecursiveListing(output, baseDirectory) {
+    const videos = [];
+    let currentDir = '';
+
+    for (const rawLine of String(output || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        // smbclient prints a directory marker before recursively listed entries.
+        // Tracking that marker is how extension-filtered recursive results become
+        // the same SMB-relative paths used by queueing and downloads.
+        if (line.startsWith('\\')) {
+            currentDir = stripBaseDirectory(line, baseDirectory);
+            continue;
+        }
+
+        // File rows are "name  attributes size  timestamp". The filename can
+        // contain spaces, so the parser anchors on the wide whitespace before the
+        // SMB attribute field instead of splitting on every space.
+        const match = line.match(/^(.+?)\s{2,}([A-Z0-9]{1,2})\s+([0-9]+)\s{2,}.+$/);
+        if (!match) continue;
+
+        const name = match[1].trim();
+        const type = match[2];
+        if (!name || shouldSkipDirectory(name) || type.includes('D')) continue;
+
+        const remotePath = joinRemotePath(currentDir, name);
+        if (VIDEO_EXTENSIONS.has(path.posix.extname(remotePath).toLowerCase())) {
+            videos.push(remotePath);
+        }
+    }
+
+    return videos;
+}
+
+function runSmbClient(args) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('smbclient', args);
+        const stdoutChunks = [];
+        const stderrChunks = [];
+
+        proc.stdout.on('data', (chunk) => {
+            // Stream raw smbclient output live because the scan itself is useful
+            // console feedback. Keep the same chunks for parsing once the command
+            // exits so display and behavior come from one command execution.
+            process.stdout.write(chunk);
+            stdoutChunks.push(chunk);
+        });
+
+        proc.stderr.on('data', (chunk) => {
+            // smbclient status and error details are part of the command output
+            // the user asked to see, so stderr is streamed too while still being
+            // retained for error classification.
+            process.stderr.write(chunk);
+            stderrChunks.push(chunk);
+        });
+
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+            const stdout = Buffer.concat(stdoutChunks).toString();
+            const stderr = Buffer.concat(stderrChunks).toString();
+
+            if (code !== 0) {
+                // smbclient reports useful failures in stderr/stdout, especially
+                // path and auth errors. Preserve that detail so UI/status messages
+                // explain the real failure instead of only showing an exit code.
+                const detail = `${stderr || ''}${stdout || ''}`.trim();
+                const detailLines = detail.split(/\r?\n/).filter(Boolean);
+                const statusLines = detailLines.filter((line) => line.trim().startsWith('NT_STATUS_'));
+                const onlyMissingListings = statusLines.length > 0
+                    && statusLines.every((line) => MISSING_LISTING_PATTERN.test(line.trim()));
+
+                if (onlyMissingListings) {
+                    // Extension-filtered scans are allowed to find no matching
+                    // files for some or all extensions. smbclient reports that
+                    // as a nonzero status even when other extensions produced
+                    // valid output, so keep stdout and let the parser ignore the
+                    // missing-listing status lines.
+                    resolve(stdout || '');
+                    return;
+                }
+
+                reject(new Error(detail || `smbclient exited with code ${code}`));
+                return;
+            }
+
+            resolve(stdout);
+        });
+    });
 }
 
 class MediaLibrary {
     constructor(smbConfig) {
+        this.smbConfig = smbConfig;
         this.client = new SambaClient({
             address: smbConfig.address,
-            directory: smbConfig.directory
+            username: smbConfig.username,
+            password: smbConfig.password,
+            domain: smbConfig.domain,
+            port: smbConfig.port,
+            directory: smbConfig.directory,
+            timeout: smbConfig.timeout,
+            maxProtocol: smbConfig.maxProtocol
         });
         this.allVideos = [];
     }
@@ -48,31 +182,79 @@ class MediaLibrary {
         // Keep the public library as SMB-relative paths. That lets one string do
         // all three jobs consistently: display in the UI, search in Fuse, and
         // download from the share with samba-client.getFile().
-        this.allVideos = await this.listVideosRecursive('');
+        this.allVideos = await this.listVideosHybrid();
         return this.allVideos;
     }
 
-    async listVideosRecursive(remoteDir) {
+    async listRootDirectory() {
         const videos = [];
-        const listPattern = remoteDir ? joinRemotePath(remoteDir, SMB_ROOT_PATTERN) : SMB_ROOT_PATTERN;
-        const remoteFiles = await this.client.list(listPattern);
+        const childDirectories = [];
+        const remoteFiles = await this.client.list('*');
 
         for (const file of remoteFiles) {
-            const remotePath = joinRemotePath(remoteDir, file.name);
-
             if (isDirectory(file)) {
                 if (shouldSkipDirectory(file.name)) continue;
 
-                // Folder support needs real recursion because samba-client.list()
-                // only returns the entries for the pattern it is given. A nested
-                // video such as "movies/trailers/foo.mkv" is invisible unless each
-                // parent folder is listed and then walked.
-                videos.push(...await this.listVideosRecursive(remotePath));
+                // Root is the only directory we inspect entry-by-entry. That lets
+                // us reject `.hist` before any recursive command can enter it,
+                // while still avoiding one SMB command for every nested folder.
+                childDirectories.push(file.name);
                 continue;
             }
 
             if (isVideoFile(file)) {
-                videos.push(remotePath);
+                videos.push(file.name);
+            }
+        }
+
+        return { videos, childDirectories };
+    }
+
+    buildRecursiveListArgs(remoteDir) {
+        const args = [];
+        const scanDirectory = joinRemotePath(this.smbConfig.directory, remoteDir);
+
+        // Match samba-client's auth behavior so scanning and downloading work
+        // from the same simple config. Guest shares get `-N`; authenticated
+        // shares can still use username/password/domain when present.
+        args.push('-U', this.smbConfig.username || 'guest');
+        if (this.smbConfig.password) args.push('--password', this.smbConfig.password);
+        else args.push('-N');
+
+        if (this.smbConfig.domain) args.push('-W', this.smbConfig.domain);
+        if (scanDirectory) args.push('-D', scanDirectory);
+        if (this.smbConfig.maxProtocol) args.push('--max-protocol', this.smbConfig.maxProtocol);
+        if (this.smbConfig.port) args.push('-p', String(this.smbConfig.port));
+        if (this.smbConfig.timeout) args.push('-t', String(this.smbConfig.timeout));
+
+        // Scope recursion to one allowed top-level folder. smbclient still walks
+        // that folder internally, but it never gets a chance to enter ignored
+        // root metadata folders such as `.hist`.
+        const listCommands = Array.from(VIDEO_EXTENSIONS, (extension) => `ls *${extension}`);
+        args.push('-c', ['recurse', ...listCommands].join(';'), this.smbConfig.address);
+        return args;
+    }
+
+    async listVideosUnderTopLevelDirectory(remoteDir) {
+        const output = await runSmbClient(this.buildRecursiveListArgs(remoteDir));
+        const scanDirectory = joinRemotePath(this.smbConfig.directory, remoteDir);
+        return parseRecursiveListing(output, scanDirectory).map((name) => joinRemotePath(remoteDir, name));
+    }
+
+    async listVideosHybrid() {
+        const root = await this.listRootDirectory();
+        const videos = root.videos.slice();
+
+        // The hybrid scan is intentionally shaped around this share's bottleneck:
+        // skip metadata folders at root, then let smbclient recurse internally
+        // inside only the allowed media folders. Batching keeps startup responsive
+        // without launching an unbounded number of smbclient processes.
+        for (let i = 0; i < root.childDirectories.length; i += TOP_LEVEL_SCAN_CONCURRENCY) {
+            const batch = root.childDirectories.slice(i, i + TOP_LEVEL_SCAN_CONCURRENCY);
+            const results = await Promise.all(batch.map((remoteDir) => this.listVideosUnderTopLevelDirectory(remoteDir)));
+
+            for (const result of results) {
+                videos.push(...result);
             }
         }
 

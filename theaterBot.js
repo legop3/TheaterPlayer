@@ -74,6 +74,10 @@ function startTheaterBot(serverUrl, handlers = {}) {
                 const query = text.startsWith('!play ')
                     ? textRaw.slice(6).trim()
                     : textRaw.slice(7).trim();
+                // Search can require a fresh SMB scan, so acknowledge the command
+                // before awaiting the handler. That gives chat immediate feedback
+                // instead of looking like the bot ignored the request.
+                await sendBotMessage(`Searching for: ${query}`);
                 const result = await onFindAndPlay(query);
                 if (result && result.ok) {
                     await sendBotMessage(`Playing: ${result.matched}`);
