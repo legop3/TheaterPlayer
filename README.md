@@ -1,6 +1,21 @@
 # Theater Player
 An mpv powered automatic media player. Mounts an smb folder and shuffles it's videos one after the other.
 
+## config
+Livestream aliases can be configured with a top-level `streams` map:
+
+```yaml
+streams:
+  kmart channel: "http://stream.vrcdn.live/live/dmtz.live.ts"
+```
+
+## chat commands
+- `!help` shows the available commands.
+- `!skip`, `!tskip`, `tsk`, or `!tsk` skips the current item.
+- `!play <url, stream alias, or search text>` plays a direct mpv-supported URL, fuzzy matches configured stream aliases, then fuzzy searches SMB files.
+- `!now` shows the current item, status, and progress.
+- `!info` shows status, library count, queue count, configured stream count, and the current item.
+
 ## dev flow notes
 1. program opens
 2. loads config

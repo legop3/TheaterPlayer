@@ -4,8 +4,21 @@ const { spawn, execFile } = require('child_process');
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.opus', '.m4a', '.aac']);
 
-function isAudioFile(filePath) {
-    return AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+function isLikelyUrl(source) {
+    try {
+        // Direct stream playback intentionally supports every URL protocol that
+        // the installed mpv/FFmpeg stack supports. This check only decides
+        // whether the source is URL-shaped so local-file-only behavior, such as
+        // audio extension handling, is not applied to arbitrary remote URLs.
+        const parsed = new URL(String(source || ''));
+        return Boolean(parsed.protocol);
+    } catch (_) {
+        return false;
+    }
+}
+
+function isAudioFile(source) {
+    return !isLikelyUrl(source) && AUDIO_EXTENSIONS.has(path.extname(source).toLowerCase());
 }
 
 function getDurationSeconds(filePath) {
@@ -23,16 +36,19 @@ function getDurationSeconds(filePath) {
     });
 }
 
-function playWithMpv(filePath, displayConfig) {
+function playWithMpv(source, displayConfig) {
     const args = [];
     if (displayConfig && displayConfig.fullscreen) args.push('--fs');
     if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
     args.push('--af=loudnorm');
 
-    if (isAudioFile(filePath)) {
+    if (isAudioFile(source)) {
         // Audio-only files need a video stream so the theater display has
         // something intentional to show. The filter splits mpv's first audio
         // stream into normal audio output and FFmpeg's showcqt visualizer output.
+        // This deliberately stays local-file-only because a stream URL can
+        // represent video, audio, a playlist, or a protocol where extension
+        // guessing is misleading. mpv should decide how remote sources render.
         args.push('--lavfi-complex=[aid1]asplit[ao][a]; [a]showcqt[vo]');
     }
 
@@ -42,7 +58,7 @@ function playWithMpv(filePath, displayConfig) {
     // is the final authority on which audio ids can actually be selected.
     args.push('--alang=eng,en,english');
 
-    args.push(filePath);
+    args.push(source);
 
     const proc = spawn('mpv', args, { stdio: 'inherit' });
     const done = new Promise((resolve, reject) => {

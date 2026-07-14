@@ -3,12 +3,13 @@ const path = require('path');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const Fuse = require('fuse.js');
 
 const { startTheaterBot } = require('./theaterBot');
 const { loadConfig } = require('./services/config');
 const { getDurationSeconds, playWithMpv } = require('./services/playback');
 const { createPlayerState, broadcastState } = require('./services/state');
-const { QueueManager } = require('./services/queueManager');
+const { QueueManager, createFileItem, getItemDisplayName } = require('./services/queueManager');
 const { MediaLibrary } = require('./services/mediaLibrary');
 
 const DEFAULT_CACHE_DIR = '/var/tmp/theaterplayer';
@@ -43,10 +44,63 @@ function getLocalCachePath(cacheDir, remoteName) {
     return localPath;
 }
 
+function createStreamItem(name, url) {
+    // Streams are intentionally represented with the same small item contract as
+    // files. The `type` tells the playback loop to skip SMB download/duration
+    // probing, while `name` keeps chat and UI output readable.
+    return { type: 'stream', name, url };
+}
+
+function getConfiguredStreams(rawStreams) {
+    // The config file is meant to stay simple: a top-level map of alias -> URL.
+    // Filtering here keeps malformed entries from crashing startup while still
+    // making the valid aliases available to fuzzy search.
+    return Object.entries(rawStreams || {})
+        .map(([alias, url]) => ({
+            alias: String(alias || '').trim(),
+            url: String(url || '').trim()
+        }))
+        .filter((stream) => stream.alias && stream.url);
+}
+
+function parseUrlLikeSource(value) {
+    try {
+        // There is deliberately no protocol allowlist. mpv and the installed
+        // FFmpeg/ytdl stack are the authority on which protocols and stream
+        // formats are supported on this machine; the app only decides whether
+        // the user's input is URL-shaped enough to pass straight through.
+        const parsed = new URL(String(value || '').trim());
+        return parsed.protocol ? parsed.href : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function findBestStreamAlias(query, streams) {
+    const q = String(query || '').trim();
+    if (!q || streams.length === 0) return null;
+
+    // Fuse is already used for file search, so stream aliases use the same
+    // library instead of introducing a second fuzzy matching behavior. Exact
+    // alias matches are naturally scored best, while partial or misspelled names
+    // can still work when the score is confident enough.
+    const fuse = new Fuse(streams, {
+        keys: ['alias'],
+        includeScore: true,
+        threshold: 0.45,
+        ignoreLocation: true,
+        minMatchCharLength: 2
+    });
+
+    const results = fuse.search(q);
+    return results.length > 0 ? results[0].item : null;
+}
+
 async function main() {
     const config = loadConfig();
     const webPort = (config.web && config.web.port) || 3000;
     const tempDir = (config.storage && config.storage.cacheDir) || DEFAULT_CACHE_DIR;
+    const streams = getConfiguredStreams(config.streams);
     fs.mkdirSync(tempDir, { recursive: true });
 
     const app = express();
@@ -83,27 +137,84 @@ async function main() {
     async function refreshAndRefill(currentName) {
         await mediaLibrary.refresh();
         queueManager.refill(mediaLibrary.getAllVideos(), currentName);
-        state.queue = queueManager.getQueue();
+        state.queue = queueManager.getDisplayQueue();
         syncState();
     }
 
     async function findAndPlayByQuery(query) {
+        const q = String(query || '').trim();
+        if (!q) return { ok: false, message: 'Usage: !play <url, stream alias, or search text>' };
+
+        const directUrl = parseUrlLikeSource(q);
+        if (directUrl) {
+            // Direct URLs bypass fuzzy search entirely. That lets someone paste
+            // any mpv-supported stream/media URL and have it play exactly as
+            // entered instead of being compared with local filenames.
+            const streamItem = createStreamItem(directUrl, directUrl);
+            queueManager.forceNext(streamItem);
+            state.queue = queueManager.getDisplayQueue();
+            state.status = `queued stream: ${directUrl}`;
+            syncState();
+
+            skipCurrentPlayback();
+            return { ok: true, type: 'stream', matched: directUrl };
+        }
+
+        const streamMatch = findBestStreamAlias(q, streams);
+        if (streamMatch) {
+            const streamItem = createStreamItem(streamMatch.alias, streamMatch.url);
+            queueManager.forceNext(streamItem);
+            state.queue = queueManager.getDisplayQueue();
+            state.status = `queued stream: ${streamMatch.alias}`;
+            syncState();
+
+            skipCurrentPlayback();
+            return { ok: true, type: 'stream', matched: streamMatch.alias };
+        }
+
         await mediaLibrary.refresh();
-        const result = mediaLibrary.findBestMatch(query);
+        const result = mediaLibrary.findBestMatch(q);
         if (!result.ok) return result;
 
-        queueManager.forceNext(result.matched);
-        state.queue = queueManager.getQueue();
+        queueManager.forceNext(createFileItem(result.matched));
+        state.queue = queueManager.getDisplayQueue();
         state.status = `queued from search: ${result.matched}`;
         syncState();
 
         skipCurrentPlayback();
-        return result;
+        return { ...result, type: 'file' };
+    }
+
+    function getNowMessage() {
+        const current = state.title || 'Nothing playing';
+        const firstLine = state.playbackType === 'stream'
+            ? `Now playing stream: ${current}`
+            : `Now playing: ${current}`;
+        return [
+            firstLine,
+            `Status: ${state.status || 'unknown'}`,
+            `Progress: ${state.isLive ? 'live' : (state.progressLabel || '--:--/--:--')}`
+        ].join('\n');
+    }
+
+    function getInfoMessage() {
+        // These counts are intentionally direct snapshots. `!info` should be
+        // fast and non-disruptive, so it reports the most recent library scan
+        // rather than forcing a new SMB traversal from chat.
+        return [
+            `Status: ${state.status || 'unknown'}`,
+            `Library files: ${mediaLibrary.getAllVideos().length}`,
+            `Queued items: ${queueManager.getQueue().length}`,
+            `Configured streams: ${streams.length}`,
+            `Current: ${state.title || 'Nothing playing'}`
+        ].join('\n');
     }
 
     startTheaterBot(config.bot && config.bot.serverUrl, {
         onSkip: skipCurrentPlayback,
         onFindAndPlay: findAndPlayByQuery,
+        onNow: getNowMessage,
+        onInfo: getInfoMessage,
         profileImage: config.bot && config.bot.profileImage
     });
 
@@ -114,22 +225,50 @@ async function main() {
         try {
             await refreshAndRefill(null);
 
-            const nextName = queueManager.shiftNext();
-            if (!nextName) {
+            const nextItem = queueManager.shiftNext();
+            if (!nextItem) {
                 state.status = 'no videos found, retrying';
                 syncState();
                 await new Promise((r) => setTimeout(r, REFILL_RETRY_MS));
                 continue;
             }
 
-            state.queue = queueManager.getQueue();
-            state.status = 'downloading';
-            state.title = nextName;
+            const nextDisplayName = getItemDisplayName(nextItem);
+            state.queue = queueManager.getDisplayQueue();
+            state.playbackType = nextItem.type;
+            state.isLive = nextItem.type === 'stream';
+            state.status = nextItem.type === 'stream' ? 'playing stream' : 'downloading';
+            state.title = nextDisplayName;
             state.durationSeconds = null;
             state.elapsedSeconds = null;
             state.remainingSeconds = null;
             syncState();
 
+            if (nextItem.type === 'stream') {
+                // Livestreams and direct remote media sources should go straight
+                // to mpv. Downloading or ffprobing them would either be wrong
+                // for endless streams or slow for protocol-specific sources that
+                // mpv already knows how to open.
+                queueManager.refill(mediaLibrary.getAllVideos(), null);
+                state.queue = queueManager.getDisplayQueue();
+                syncState();
+
+                const playback = playWithMpv(nextItem.url, config.display);
+                currentMpvProcess = playback.proc;
+                const playResult = await playback.done;
+                currentMpvProcess = null;
+
+                if (playResult && playResult.signal === 'SIGTERM') state.status = 'skipped';
+                else state.status = 'ended';
+                state.isLive = false;
+                state.playbackType = null;
+                state.elapsedSeconds = null;
+                state.remainingSeconds = null;
+                syncState();
+                continue;
+            }
+
+            const nextName = nextItem.name;
             const localPath = getLocalCachePath(tempDir, nextName);
             try {
                 // Nested SMB videos map to nested cache paths. Ensure the local
@@ -146,13 +285,15 @@ async function main() {
             }
 
             queueManager.refill(mediaLibrary.getAllVideos(), nextName);
-            state.queue = queueManager.getQueue();
+            state.queue = queueManager.getDisplayQueue();
             syncState();
 
             state.durationSeconds = await getDurationSeconds(localPath);
             state.elapsedSeconds = 0;
             state.remainingSeconds = state.durationSeconds;
             state.status = 'playing';
+            state.isLive = false;
+            state.playbackType = 'file';
             syncState();
 
             const startedAt = Date.now();
@@ -172,6 +313,8 @@ async function main() {
 
             if (playResult && playResult.signal === 'SIGTERM') state.status = 'skipped';
             else state.status = 'ended';
+            state.playbackType = null;
+            state.isLive = false;
             state.elapsedSeconds = state.durationSeconds;
             state.remainingSeconds = 0;
             syncState();

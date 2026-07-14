@@ -9,6 +9,8 @@ function formatSeconds(totalSeconds) {
 function createPlayerState() {
     return {
         title: 'Nothing playing',
+        playbackType: null,
+        isLive: false,
         durationSeconds: null,
         elapsedSeconds: null,
         remainingSeconds: null,
@@ -22,10 +24,20 @@ function createPlayerState() {
 }
 
 function broadcastState(io, state) {
-    state.durationLabel = formatSeconds(state.durationSeconds);
-    state.elapsedLabel = formatSeconds(state.elapsedSeconds);
-    state.remainingLabel = formatSeconds(state.remainingSeconds);
-    state.progressLabel = `${state.elapsedLabel}/${state.durationLabel}`;
+    if (state.isLive) {
+        // Livestreams do not have a meaningful fixed duration. Showing "live"
+        // makes chat/UI output honest instead of pretending there is a normal
+        // elapsed/remaining timeline.
+        state.durationLabel = 'live';
+        state.elapsedLabel = 'live';
+        state.remainingLabel = 'live';
+        state.progressLabel = 'live';
+    } else {
+        state.durationLabel = formatSeconds(state.durationSeconds);
+        state.elapsedLabel = formatSeconds(state.elapsedSeconds);
+        state.remainingLabel = formatSeconds(state.remainingSeconds);
+        state.progressLabel = `${state.elapsedLabel}/${state.durationLabel}`;
+    }
     io.emit('state', state);
 }
 

@@ -3,6 +3,8 @@ const { io } = require('socket.io-client');
 function startTheaterBot(serverUrl, handlers = {}) {
     const onSkip = handlers.onSkip || (() => false);
     const onFindAndPlay = handlers.onFindAndPlay || (async () => ({ ok: false, message: 'Search unavailable.' }));
+    const onNow = handlers.onNow || (() => 'Current playback is unavailable.');
+    const onInfo = handlers.onInfo || (() => 'Theater info is unavailable.');
     const profileImage = handlers.profileImage || '';
 
     if (!serverUrl) {
@@ -36,7 +38,9 @@ function startTheaterBot(serverUrl, handlers = {}) {
     const helpCommands = [
         { command: '!help', description: 'Show available commands.' },
         { command: '!skip or tsk', description: 'Skip the currently playing video.' },
-        { command: '!play <search text>', description: 'Find and play the best matching video.' }
+        { command: '!play <url, stream alias, or search text>', description: 'Play a stream URL, stream alias, or matching file.' },
+        { command: '!now', description: 'Show what is currently playing.' },
+        { command: '!info', description: 'Show theater status and library counts.' }
     ];
 
     socket.on('connect', async () => {
@@ -70,6 +74,16 @@ function startTheaterBot(serverUrl, handlers = {}) {
                 return;
             }
 
+            if (text === '!now') {
+                await sendBotMessage(onNow());
+                return;
+            }
+
+            if (text === '!info') {
+                await sendBotMessage(onInfo());
+                return;
+            }
+
             if (text.startsWith('!play ') || text.startsWith('!tfind ')) {
                 const query = text.startsWith('!play ')
                     ? textRaw.slice(6).trim()
@@ -80,7 +94,8 @@ function startTheaterBot(serverUrl, handlers = {}) {
                 await sendBotMessage(`Searching for: ${query}`);
                 const result = await onFindAndPlay(query);
                 if (result && result.ok) {
-                    await sendBotMessage(`Playing: ${result.matched}`);
+                    const prefix = result.type === 'stream' ? 'Playing stream' : 'Playing';
+                    await sendBotMessage(`${prefix}: ${result.matched}`);
                 } else {
                     await sendBotMessage(result && result.message ? result.message : 'No match found.');
                 }
