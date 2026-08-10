@@ -10,4 +10,12 @@ bot:
 storage:
   cacheDir: "/var/tmp/theaterplayer"
 streams:
-  kmart channel: "http://stream.vrcdn.live/live/dmtz.live.ts"
+  Kmart Channel: "http://stream.vrcdn.live/live/dmtz.live.ts"
+  KOCT Community Channel 18: "https://securestream10.champds.com/LIVE/KOCTCALIVE/KOCTCALIVE.m3u8"
+  BRAVO underwater fish/research camera: "https://stream.biotactic.com/bravo/node10/playlist.m3u8"
+  Italian Motorsports: "https://webstream.multistream.it/memfs/e2cb3629-c1a2-495b-b43a-9eb386f04ed8.m3u8"
+  Classic arts channel: "https://classicarts.akamaized.net/hls/live/1024257/CAS/master.m3u8"
+  Philadelphia public-access TV: "https://livestream.telvue.com/phillycam1/f7b44cfafd5c52223d5498196c8a2e7b.sdp/playlist.m3u8"
+  Temple University Television: "https://livestream.telvue.com/templeuni1/f7b44cfafd5c52223d5498196c8a2e7b.sdp/playlist.m3u8"
+  New Hampshire public access: "https://livestream.telvue.com/nashuanh1/f7b44cfafd5c52223d5498196c8a2e7b.sdp/playlist.m3u8"
+  School System TV: "https://livestream.telvue.com/nashuanh2/f7b44cfafd5c52223d5498196c8a2e7b.sdp/playlist.m3u8"
