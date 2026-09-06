@@ -7,7 +7,7 @@ const Fuse = require('fuse.js');
 
 const { startTheaterBot } = require('./theaterBot');
 const { loadConfig } = require('./services/config');
-const { getDurationSeconds, playWithMpv } = require('./services/playback');
+const { getDurationSeconds, playWithMpv, cleanupTempDir } = require('./services/playback');
 const { createPlayerState, broadcastState } = require('./services/state');
 const { QueueManager, createFileItem, getItemDisplayName } = require('./services/queueManager');
 const { MediaLibrary } = require('./services/mediaLibrary');
@@ -15,6 +15,7 @@ const { MediaLibrary } = require('./services/mediaLibrary');
 const DEFAULT_CACHE_DIR = '/var/tmp/theaterplayer';
 const QUEUE_TARGET = 6;
 const REFILL_RETRY_MS = 5000;
+const CACHE_CLEANUP_INTERVAL_MS = 12 * 60 * 60 * 1000;
 
 function getLocalCachePath(cacheDir, remoteName) {
     // Remote library names are SMB-relative paths such as "trailers/foo.mkv".
@@ -123,6 +124,7 @@ async function main() {
     const queueManager = new QueueManager(QUEUE_TARGET);
 
     let currentMpvProcess = null;
+    let nextCacheCleanupAt = Date.now() + CACHE_CLEANUP_INTERVAL_MS;
 
     function skipCurrentPlayback() {
         if (!currentMpvProcess) return false;
@@ -223,6 +225,20 @@ async function main() {
 
     while (true) {
         try {
+            // Cache cleanup happens only at this safe boundary between playback
+            // iterations. A wall-clock interval could fire while samba-client is
+            // writing a download and remove the file before ffprobe or mpv opens
+            // it. Waiting until the loop returns here avoids that race and also
+            // lets the current video finish before its cached file is removed.
+            if (Date.now() >= nextCacheCleanupAt) {
+                cleanupTempDir(tempDir);
+
+                // Base the next deadline on the cleanup that just ran. This keeps
+                // long videos or temporary playback errors from causing several
+                // overdue cleanups to run back-to-back when the loop resumes.
+                nextCacheCleanupAt = Date.now() + CACHE_CLEANUP_INTERVAL_MS;
+            }
+
             await refreshAndRefill(null);
 
             const nextItem = queueManager.shiftNext();
