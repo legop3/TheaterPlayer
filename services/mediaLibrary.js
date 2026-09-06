@@ -113,7 +113,10 @@ function parseRecursiveListing(output, baseDirectory) {
 
         const remotePath = joinRemotePath(currentDir, name);
         if (MEDIA_EXTENSIONS.has(path.posix.extname(remotePath).toLowerCase())) {
-            videos.push(remotePath);
+            // Preserve the size already included in smbclient's listing. The
+            // downloader needs the remote total to calculate a real percentage
+            // and ETA while the destination file grows.
+            videos.push({ name: remotePath, size: Number(match[3]) });
         }
     }
 
@@ -127,18 +130,15 @@ function runSmbClient(args) {
         const stderrChunks = [];
 
         proc.stdout.on('data', (chunk) => {
-            // Stream raw smbclient output live because the scan itself is useful
-            // console feedback. Keep the same chunks for parsing once the command
-            // exits so display and behavior come from one command execution.
-            process.stdout.write(chunk);
+            // Retain stdout for parsing after the process exits. It is not sent
+            // directly to the terminal because the concise status display now
+            // represents the scan without dumping every remote listing line.
             stdoutChunks.push(chunk);
         });
 
         proc.stderr.on('data', (chunk) => {
-            // smbclient status and error details are part of the command output
-            // the user asked to see, so stderr is streamed too while still being
-            // retained for error classification.
-            process.stderr.write(chunk);
+            // Retain stderr so failures still include smbclient's exact detail,
+            // while preventing child output from overwriting the terminal UI.
             stderrChunks.push(chunk);
         });
 
@@ -190,13 +190,16 @@ class MediaLibrary {
             maxProtocol: smbConfig.maxProtocol
         });
         this.allVideos = [];
+        this.videoSizes = new Map();
     }
 
     async refresh() {
         // Keep the public library as SMB-relative paths. That lets one string do
-        // all three jobs consistently: display in the UI, search in Fuse, and
-        // download from the share with samba-client.getFile().
-        this.allVideos = await this.listVideosHybrid();
+        // all three jobs consistently: display in status output, search in Fuse,
+        // and download from the share with samba-client.getFile().
+        const videos = await this.listVideosHybrid();
+        this.allVideos = videos.map((video) => video.name);
+        this.videoSizes = new Map(videos.map((video) => [video.name, video.size]));
         return this.allVideos;
     }
 
@@ -217,7 +220,7 @@ class MediaLibrary {
             }
 
             if (isMediaFile(file)) {
-                videos.push(file.name);
+                videos.push({ name: file.name, size: file.size });
             }
         }
 
@@ -252,7 +255,10 @@ class MediaLibrary {
     async listVideosUnderTopLevelDirectory(remoteDir) {
         const output = await runSmbClient(this.buildRecursiveListArgs(remoteDir));
         const scanDirectory = joinRemotePath(this.smbConfig.directory, remoteDir);
-        return parseRecursiveListing(output, scanDirectory).map((name) => joinRemotePath(remoteDir, name));
+        return parseRecursiveListing(output, scanDirectory).map((video) => ({
+            name: joinRemotePath(remoteDir, video.name),
+            size: video.size
+        }));
     }
 
     async listVideosHybrid() {
@@ -279,7 +285,7 @@ class MediaLibrary {
         return this.allVideos.slice();
     }
 
-    async download(name, localPath) {
+    async download(name, localPath, onProgress = () => {}) {
         try {
             const stat = fs.statSync(localPath);
             if (stat.isFile() && stat.size > 0) {
@@ -287,7 +293,45 @@ class MediaLibrary {
             }
         } catch (_) {}
 
-        await this.client.getFile(name, localPath);
+        const totalBytes = this.videoSizes.get(name);
+        const startedAt = Date.now();
+
+        const reportProgress = () => {
+            let transferredBytes = 0;
+            try {
+                transferredBytes = fs.statSync(localPath).size;
+            } catch (_) {}
+
+            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+            const bytesPerSecond = transferredBytes / elapsedSeconds;
+            const remainingBytes = Number.isFinite(totalBytes)
+                ? Math.max(0, totalBytes - transferredBytes)
+                : null;
+
+            onProgress({
+                transferredBytes,
+                totalBytes,
+                bytesPerSecond,
+                percent: Number.isFinite(totalBytes) && totalBytes > 0
+                    ? Math.min(1, transferredBytes / totalBytes)
+                    : null,
+                etaSeconds: remainingBytes != null && bytesPerSecond > 0
+                    ? remainingBytes / bytesPerSecond
+                    : null
+            });
+        };
+
+        // samba-client waits for smbclient to finish and does not expose transfer
+        // events. Polling the actual destination size provides real byte progress
+        // without replacing the established and working SMB download library.
+        reportProgress();
+        const progressTimer = setInterval(reportProgress, 250);
+        try {
+            await this.client.getFile(name, localPath);
+            reportProgress();
+        } finally {
+            clearInterval(progressTimer);
+        }
         return { fromCache: false };
     }
 

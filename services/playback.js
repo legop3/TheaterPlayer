@@ -60,7 +60,10 @@ function playWithMpv(source, displayConfig) {
 
     args.push(source);
 
-    const proc = spawn('mpv', args, { stdio: 'inherit' });
+    // mpv normally writes a continuously refreshed status line of its own. The
+    // application now owns the terminal display, so discard that child output
+    // and report playback state through the shared status model instead.
+    const proc = spawn('mpv', args, { stdio: 'ignore' });
     const done = new Promise((resolve, reject) => {
         proc.on('error', reject);
         proc.on('close', (code, signal) => resolve({ code, signal }));

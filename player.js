@@ -1,14 +1,12 @@
 const fs = require('fs');
 const path = require('path');
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
 const Fuse = require('fuse.js');
 
 const { startTheaterBot } = require('./theaterBot');
 const { loadConfig } = require('./services/config');
 const { getDurationSeconds, playWithMpv, cleanupTempDir } = require('./services/playback');
-const { createPlayerState, broadcastState } = require('./services/state');
+const { createPlayerState, updateFormattedState } = require('./services/state');
+const { createTerminalUi } = require('./services/terminalUi');
 const { QueueManager, createFileItem, getItemDisplayName } = require('./services/queueManager');
 const { MediaLibrary } = require('./services/mediaLibrary');
 
@@ -99,26 +97,18 @@ function findBestStreamAlias(query, streams) {
 
 async function main() {
     const config = loadConfig();
-    const webPort = (config.web && config.web.port) || 3000;
     const tempDir = (config.storage && config.storage.cacheDir) || DEFAULT_CACHE_DIR;
     const streams = getConfiguredStreams(config.streams);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    const app = express();
-    const server = http.createServer(app);
-    const io = new Server(server);
-    app.use(express.static(path.join(__dirname, 'public')));
-
     const state = createPlayerState();
-    const syncState = () => broadcastState(io, state);
-
-    io.on('connection', (socket) => {
-        socket.emit('state', state);
-    });
-
-    server.listen(webPort, () => {
-        console.log(`web ui: http://localhost:${webPort}`);
-    });
+    const terminalUi = createTerminalUi();
+    const syncState = () => {
+        // Formatting remains centralized in the state service so terminal and
+        // chat output share the exact same elapsed and remaining time labels.
+        updateFormattedState(state);
+        terminalUi.render(state);
+    };
 
     const mediaLibrary = new MediaLibrary(config.smb);
     const queueManager = new QueueManager(QUEUE_TARGET);
@@ -137,6 +127,9 @@ async function main() {
     }
 
     async function refreshAndRefill(currentName) {
+        state.status = 'searching media library';
+        state.downloadProgress = null;
+        syncState();
         await mediaLibrary.refresh();
         queueManager.refill(mediaLibrary.getAllVideos(), currentName);
         state.queue = queueManager.getDisplayQueue();
@@ -174,9 +167,30 @@ async function main() {
             return { ok: true, type: 'stream', matched: streamMatch.alias };
         }
 
-        await mediaLibrary.refresh();
-        const result = mediaLibrary.findBestMatch(q);
-        if (!result.ok) return result;
+        const statusBeforeSearch = state.status;
+        state.status = 'searching';
+        syncState();
+
+        let result;
+        try {
+            await mediaLibrary.refresh();
+            result = mediaLibrary.findBestMatch(q);
+        } catch (error) {
+            // A chat-triggered lookup can run while ordinary playback continues.
+            // Restore that real playback status if the lookup itself fails so the
+            // terminal does not remain stuck on "Searching" after the exception.
+            state.status = statusBeforeSearch;
+            syncState();
+            throw error;
+        }
+
+        if (!result.ok) {
+            // A search with no match did not alter playback, so its temporary
+            // activity label must give control back to the preceding status.
+            state.status = statusBeforeSearch;
+            syncState();
+            return result;
+        }
 
         queueManager.forceNext(createFileItem(result.matched));
         state.queue = queueManager.getDisplayQueue();
@@ -231,6 +245,9 @@ async function main() {
             // it. Waiting until the loop returns here avoids that race and also
             // lets the current video finish before its cached file is removed.
             if (Date.now() >= nextCacheCleanupAt) {
+                state.status = 'cleaning cache';
+                state.downloadProgress = null;
+                syncState();
                 cleanupTempDir(tempDir);
 
                 // Base the next deadline on the cleanup that just ran. This keeps
@@ -258,6 +275,7 @@ async function main() {
             state.durationSeconds = null;
             state.elapsedSeconds = null;
             state.remainingSeconds = null;
+            state.downloadProgress = null;
             syncState();
 
             if (nextItem.type === 'stream') {
@@ -292,7 +310,13 @@ async function main() {
                 // cleanup or a fresh machine cannot make samba-client.getFile()
                 // fail with a missing local directory.
                 fs.mkdirSync(path.dirname(localPath), { recursive: true });
-                const downloadResult = await mediaLibrary.download(nextName, localPath);
+                const downloadResult = await mediaLibrary.download(nextName, localPath, (progress) => {
+                    // The MediaLibrary reports bytes observed in the destination
+                    // file. Publishing that snapshot here lets the terminal own
+                    // presentation while the download service owns measurement.
+                    state.downloadProgress = progress;
+                    syncState();
+                });
                 state.status = downloadResult.fromCache ? 'using cached file' : 'downloaded';
                 syncState();
             } catch (downloadError) {
@@ -304,6 +328,8 @@ async function main() {
             state.queue = queueManager.getDisplayQueue();
             syncState();
 
+            state.status = 'inspecting media';
+            syncState();
             state.durationSeconds = await getDurationSeconds(localPath);
             state.elapsedSeconds = 0;
             state.remainingSeconds = state.durationSeconds;
@@ -331,14 +357,15 @@ async function main() {
             else state.status = 'ended';
             state.playbackType = null;
             state.isLive = false;
+            state.downloadProgress = null;
             state.elapsedSeconds = state.durationSeconds;
             state.remainingSeconds = 0;
             syncState();
 
         } catch (e) {
-            state.status = `error: ${e.message}`;
+            state.status = `error: ${e.message}; retrying`;
+            state.downloadProgress = null;
             syncState();
-            console.error(e);
             await new Promise((r) => setTimeout(r, REFILL_RETRY_MS));
         }
     }

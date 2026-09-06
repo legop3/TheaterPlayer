@@ -18,12 +18,13 @@ function createPlayerState() {
         elapsedLabel: '--:--',
         remainingLabel: '--:--',
         progressLabel: '--:--/--:--',
+        downloadProgress: null,
         queue: [],
         status: 'starting'
     };
 }
 
-function broadcastState(io, state) {
+function updateFormattedState(state) {
     if (state.isLive) {
         // Livestreams do not have a meaningful fixed duration. Showing "live"
         // makes chat/UI output honest instead of pretending there is a normal
@@ -38,7 +39,6 @@ function broadcastState(io, state) {
         state.remainingLabel = formatSeconds(state.remainingSeconds);
         state.progressLabel = `${state.elapsedLabel}/${state.durationLabel}`;
     }
-    io.emit('state', state);
 }
 
-module.exports = { createPlayerState, broadcastState };
+module.exports = { createPlayerState, updateFormattedState };

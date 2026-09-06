@@ -20,7 +20,7 @@ function getItemKey(item) {
 }
 
 function getItemDisplayName(item) {
-    // The browser UI and chat output should stay human-readable. Stream aliases
+    // Terminal and chat output should stay human-readable. Stream aliases
     // display as their alias, while direct URLs display as the URL itself.
     if (!item || typeof item !== 'object') return String(item || '');
     return item.name || item.url || '';
