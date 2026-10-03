@@ -1,16 +1,19 @@
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { startProcess, throwIfAborted, waitFor } = require('./process');
 const SambaClient = require('samba-client');
 const Fuse = require('fuse.js');
 
-const MEDIA_EXTENSIONS = new Set([
+const VIDEO_EXTENSIONS = new Set([
     '.mp4',
     '.mkv',
     '.mov',
     '.avi',
     '.webm',
-    '.m4v',
+    '.m4v'
+]);
+const MEDIA_EXTENSIONS = new Set([
+    ...VIDEO_EXTENSIONS,
     '.mp3',
     '.flac',
     '.wav',
@@ -104,7 +107,7 @@ function parseRecursiveListing(output, baseDirectory) {
         // File rows are "name  attributes size  timestamp". The filename can
         // contain spaces, so the parser anchors on the wide whitespace before the
         // SMB attribute field instead of splitting on every space.
-        const match = line.match(/^(.+?)\s{2,}([A-Z0-9]{1,2})\s+([0-9]+)\s{2,}.+$/);
+        const match = line.match(/^(.+?)\s{2,}([A-Z0-9]{1,2})\s+([0-9]+)\s{2,}(.+)$/);
         if (!match) continue;
 
         const name = match[1].trim();
@@ -116,97 +119,72 @@ function parseRecursiveListing(output, baseDirectory) {
             // Preserve the size already included in smbclient's listing. The
             // downloader needs the remote total to calculate a real percentage
             // and ETA while the destination file grows.
-            videos.push({ name: remotePath, size: Number(match[3]) });
+            videos.push({ name: remotePath, size: Number(match[3]), modified: match[4].trim() });
         }
     }
 
     return videos;
 }
 
-function runSmbClient(args) {
-    return new Promise((resolve, reject) => {
-        const proc = spawn('smbclient', args);
-        const stdoutChunks = [];
-        const stderrChunks = [];
+async function runSmbClient(args, signal, allowMissing = false) {
+    const { proc, done } = startProcess('smbclient', args, { signal });
+    const stdoutChunks = [];
+    let stderr = '';
+    proc.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
+    proc.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
+    const { code } = await done;
+    const stdout = Buffer.concat(stdoutChunks).toString();
+    if (code !== 0) {
+        const detail = `${stderr}\n${stdout}`.trim();
+        const statuses = detail.split(/\r?\n/).map((line) => line.trim())
+            .filter((line) => line.startsWith('NT_STATUS_'));
+        // Empty extension matches are normal during a recursive library scan.
+        if (!allowMissing || !statuses.length || !statuses.every((line) => MISSING_LISTING_PATTERN.test(line))) {
+            throw new Error(detail.slice(-2000) || `smbclient exited with code ${code}`);
+        }
+    }
+    return stdout;
+}
 
-        proc.stdout.on('data', (chunk) => {
-            // Retain stdout for parsing after the process exits. It is not sent
-            // directly to the terminal because the concise status display now
-            // represents the scan without dumping every remote listing line.
-            stdoutChunks.push(chunk);
-        });
-
-        proc.stderr.on('data', (chunk) => {
-            // Retain stderr so failures still include smbclient's exact detail,
-            // while preventing child output from overwriting the terminal UI.
-            stderrChunks.push(chunk);
-        });
-
-        proc.on('error', reject);
-        proc.on('close', (code) => {
-            const stdout = Buffer.concat(stdoutChunks).toString();
-            const stderr = Buffer.concat(stderrChunks).toString();
-
-            if (code !== 0) {
-                // smbclient reports useful failures in stderr/stdout, especially
-                // path and auth errors. Preserve that detail so UI/status messages
-                // explain the real failure instead of only showing an exit code.
-                const detail = `${stderr || ''}${stdout || ''}`.trim();
-                const detailLines = detail.split(/\r?\n/).filter(Boolean);
-                const statusLines = detailLines.filter((line) => line.trim().startsWith('NT_STATUS_'));
-                const onlyMissingListings = statusLines.length > 0
-                    && statusLines.every((line) => MISSING_LISTING_PATTERN.test(line.trim()));
-
-                if (onlyMissingListings) {
-                    // Extension-filtered scans are allowed to find no matching
-                    // files for some or all extensions. smbclient reports that
-                    // as a nonzero status even when other extensions produced
-                    // valid output, so keep stdout and let the parser ignore the
-                    // missing-listing status lines.
-                    resolve(stdout || '');
-                    return;
-                }
-
-                reject(new Error(detail || `smbclient exited with code ${code}`));
-                return;
-            }
-
-            resolve(stdout);
-        });
-    });
+function createClient(config, signal) {
+    const client = new SambaClient(config);
+    // Keep the library's SMB argument construction and listing parser, but own
+    // its child process so cancellation reaches both scans and downloads.
+    client.execute = (command, args) => runSmbClient(client.getSmbClientArgs(command, args), signal);
+    return client;
 }
 
 class MediaLibrary {
     constructor(smbConfig) {
         this.smbConfig = smbConfig;
-        this.client = new SambaClient({
-            address: smbConfig.address,
-            username: smbConfig.username,
-            password: smbConfig.password,
-            domain: smbConfig.domain,
-            port: smbConfig.port,
-            directory: smbConfig.directory,
-            timeout: smbConfig.timeout,
-            maxProtocol: smbConfig.maxProtocol
-        });
         this.allVideos = [];
-        this.videoSizes = new Map();
+        this.metadata = new Map();
+        this.scanTail = Promise.resolve();
     }
 
-    async refresh() {
-        // Keep the public library as SMB-relative paths. That lets one string do
-        // all three jobs consistently: display in status output, search in Fuse,
-        // and download from the share with samba-client.getFile().
-        const videos = await this.listVideosHybrid();
-        this.allVideos = videos.map((video) => video.name);
-        this.videoSizes = new Map(videos.map((video) => [video.name, video.size]));
-        return this.allVideos;
+    async refresh(signal) {
+        // Each caller gets its own fresh scan. Serialize scans to avoid flooding
+        // the share, rather than returning an older or already-running snapshot.
+        const scan = this.scanTail.then(async () => {
+            throwIfAborted(signal);
+            const videos = await this.listVideosHybrid(signal);
+            throwIfAborted(signal);
+            this.allVideos = videos.map((video) => video.name);
+            this.metadata = new Map(videos.map((video) => [video.name, video]));
+            return this.allVideos;
+        });
+        this.scanTail = scan.catch(() => {});
+        return waitFor(scan, signal);
     }
 
-    async listRootDirectory() {
+    getFileItem(name) {
+        return { type: 'file', name, metadata: this.metadata.get(name) };
+    }
+
+    async listRootDirectory(signal) {
         const videos = [];
         const childDirectories = [];
-        const remoteFiles = await this.client.list('*');
+        const remoteFiles = await createClient(this.smbConfig, signal).list('*');
 
         for (const file of remoteFiles) {
             if (isDirectory(file)) {
@@ -220,7 +198,7 @@ class MediaLibrary {
             }
 
             if (isMediaFile(file)) {
-                videos.push({ name: file.name, size: file.size });
+                videos.push({ name: file.name, size: file.size, modified: Number.isFinite(file.modifyTime.getTime()) ? file.modifyTime.toISOString() : null });
             }
         }
 
@@ -252,17 +230,18 @@ class MediaLibrary {
         return args;
     }
 
-    async listVideosUnderTopLevelDirectory(remoteDir) {
-        const output = await runSmbClient(this.buildRecursiveListArgs(remoteDir));
+    async listVideosUnderTopLevelDirectory(remoteDir, signal) {
+        const output = await runSmbClient(this.buildRecursiveListArgs(remoteDir), signal, true);
         const scanDirectory = joinRemotePath(this.smbConfig.directory, remoteDir);
         return parseRecursiveListing(output, scanDirectory).map((video) => ({
             name: joinRemotePath(remoteDir, video.name),
-            size: video.size
+            size: video.size,
+            modified: video.modified
         }));
     }
 
-    async listVideosHybrid() {
-        const root = await this.listRootDirectory();
+    async listVideosHybrid(signal) {
+        const root = await this.listRootDirectory(signal);
         const videos = root.videos.slice();
 
         // The hybrid scan is intentionally shaped around this share's bottleneck:
@@ -271,10 +250,12 @@ class MediaLibrary {
         // without launching an unbounded number of smbclient processes.
         for (let i = 0; i < root.childDirectories.length; i += TOP_LEVEL_SCAN_CONCURRENCY) {
             const batch = root.childDirectories.slice(i, i + TOP_LEVEL_SCAN_CONCURRENCY);
-            const results = await Promise.all(batch.map((remoteDir) => this.listVideosUnderTopLevelDirectory(remoteDir)));
+            throwIfAborted(signal);
+            const results = await Promise.allSettled(batch.map((remoteDir) => this.listVideosUnderTopLevelDirectory(remoteDir, signal)));
 
             for (const result of results) {
-                videos.push(...result);
+                if (result.status === 'rejected') throw result.reason;
+                videos.push(...result.value);
             }
         }
 
@@ -285,59 +266,44 @@ class MediaLibrary {
         return this.allVideos.slice();
     }
 
-    async download(name, localPath, onProgress = () => {}) {
-        try {
-            const stat = fs.statSync(localPath);
-            if (stat.isFile() && stat.size > 0) {
-                return { fromCache: true };
-            }
-        } catch (_) {}
+    getAutoplayVideos() {
+        // Audio stays searchable for explicit requests, but never fills autoplay.
+        return this.allVideos.filter((name) => VIDEO_EXTENSIONS.has(path.posix.extname(name).toLowerCase()));
+    }
 
-        const totalBytes = this.videoSizes.get(name);
+    async download(item, localPath, signal, onProgress = () => {}) {
+        // smbclient has its own command tokenizer in addition to process argv.
+        // Reject delimiters it cannot safely represent inside a quoted filename.
+        if (/[";\r\n]/.test(item.name) || /[";\r\n]/.test(localPath)) {
+            throw new Error('SMB filename contains unsupported command delimiters');
+        }
+        const totalBytes = item.metadata && item.metadata.size;
         const startedAt = Date.now();
-
         const reportProgress = () => {
             let transferredBytes = 0;
-            try {
-                transferredBytes = fs.statSync(localPath).size;
-            } catch (_) {}
-
-            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
-            const bytesPerSecond = transferredBytes / elapsedSeconds;
-            const remainingBytes = Number.isFinite(totalBytes)
-                ? Math.max(0, totalBytes - transferredBytes)
-                : null;
-
+            try { transferredBytes = fs.statSync(localPath).size; } catch (_) {}
+            const bytesPerSecond = transferredBytes / Math.max((Date.now() - startedAt) / 1000, 0.001);
             onProgress({
-                transferredBytes,
-                totalBytes,
-                bytesPerSecond,
-                percent: Number.isFinite(totalBytes) && totalBytes > 0
-                    ? Math.min(1, transferredBytes / totalBytes)
-                    : null,
-                etaSeconds: remainingBytes != null && bytesPerSecond > 0
-                    ? remainingBytes / bytesPerSecond
-                    : null
+                transferredBytes, totalBytes, bytesPerSecond,
+                percent: totalBytes > 0 ? Math.min(1, transferredBytes / totalBytes) : null,
+                etaSeconds: Number.isFinite(totalBytes) && bytesPerSecond > 0
+                    ? Math.max(0, totalBytes - transferredBytes) / bytesPerSecond : null
             });
         };
-
-        // samba-client waits for smbclient to finish and does not expose transfer
-        // events. Polling the actual destination size provides real byte progress
-        // without replacing the established and working SMB download library.
         reportProgress();
-        const progressTimer = setInterval(reportProgress, 250);
+        const timer = setInterval(reportProgress, 250);
         try {
-            await this.client.getFile(name, localPath);
+            await createClient(this.smbConfig, signal).getFile(item.name, localPath);
+            throwIfAborted(signal);
             reportProgress();
         } finally {
-            clearInterval(progressTimer);
+            clearInterval(timer);
         }
-        return { fromCache: false };
     }
 
     findBestMatch(query) {
         const q = String(query || '').trim();
-        if (!q) return { ok: false, message: 'Usage: !tfind <search text>' };
+        if (!q) return { ok: false, message: 'Usage: !play <search text>' };
         if (this.allVideos.length === 0) return { ok: false, message: 'No videos found.' };
 
         // Fuse searches objects here instead of plain strings so a person can

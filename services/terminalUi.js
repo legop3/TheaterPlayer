@@ -6,7 +6,8 @@ const BUSY_STATUSES = new Set([
     'searching media library',
     'searching',
     'inspecting media',
-    'cleaning cache'
+    'cleaning cache',
+    'opening'
 ]);
 
 function capitalize(value) {
@@ -66,7 +67,7 @@ function truncateMiddle(value, maximumLength) {
     return `${text.slice(0, leftLength)}...${text.slice(-rightLength)}`;
 }
 
-function createTerminalUi() {
+function createTerminalUi(onQuit = () => {}) {
     const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
     let latestState = {};
     let spinnerIndex = 0;
@@ -97,8 +98,7 @@ function createTerminalUi() {
         // Blessed enables raw input mode while it owns the screen, so explicitly
         // retain the ordinary Ctrl+C behavior people expect from this process.
         screen.key(['C-c'], () => {
-            screen.destroy();
-            process.exit(0);
+            onQuit();
         });
     }
 
@@ -131,9 +131,9 @@ function createTerminalUi() {
             ];
         }
 
-        if (state.status === 'playing') {
+        if (['playing', 'paused', 'buffering'].includes(state.status)) {
             return [
-                'Playing',
+                capitalize(state.status),
                 truncateMiddle(state.title, availableWidth),
                 state.progressLabel || '--:--/--:--'
             ];
@@ -145,7 +145,7 @@ function createTerminalUi() {
 
         const statusText = truncateMiddle(capitalize(state.status), availableWidth - 2);
         if (BUSY_STATUSES.has(state.status)) {
-            return [`${SPINNER_FRAMES[spinnerIndex]} ${statusText}…`];
+            return [`${SPINNER_FRAMES[spinnerIndex]} ${statusText}…`, ...(state.status === 'opening' ? [truncateMiddle(state.title, availableWidth)] : [])];
         }
 
         return [statusText];
@@ -185,6 +185,10 @@ function createTerminalUi() {
     spinnerTimer.unref();
 
     return {
+        close() {
+            clearInterval(spinnerTimer);
+            if (screen) screen.destroy();
+        },
         render(state) {
             latestState = state;
             draw();

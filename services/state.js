@@ -1,9 +1,10 @@
 function formatSeconds(totalSeconds) {
-    if (totalSeconds == null) return '--:--';
-    const s = Math.max(0, totalSeconds);
-    const mins = Math.floor(s / 60);
+    if (!Number.isFinite(totalSeconds)) return '--:--';
+    const s = Math.floor(Math.max(0, totalSeconds));
+    const hours = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
     const secs = s % 60;
-    return `${mins}:${String(secs).padStart(2, '0')}`;
+    return `${hours ? hours + ':' + String(mins).padStart(2, '0') : mins}:${String(secs).padStart(2, '0')}`;
 }
 
 function createPlayerState() {

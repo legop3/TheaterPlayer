@@ -1,86 +1,68 @@
-const fs = require('fs');
 const path = require('path');
-const { spawn, execFile } = require('child_process');
+const { startProcess } = require('./process');
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.opus', '.m4a', '.aac']);
 
-function isLikelyUrl(source) {
-    try {
-        // Direct stream playback intentionally supports every URL protocol that
-        // the installed mpv/FFmpeg stack supports. This check only decides
-        // whether the source is URL-shaped so local-file-only behavior, such as
-        // audio extension handling, is not applied to arbitrary remote URLs.
-        const parsed = new URL(String(source || ''));
-        return Boolean(parsed.protocol);
-    } catch (_) {
-        return false;
-    }
-}
-
-function isAudioFile(source) {
-    return !isLikelyUrl(source) && AUDIO_EXTENSIONS.has(path.extname(source).toLowerCase());
-}
-
-function getDurationSeconds(filePath) {
-    return new Promise((resolve) => {
-        execFile('ffprobe', [
-            '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            filePath
-        ], (err, stdout) => {
-            if (err) return resolve(null);
-            const n = Number((stdout || '').trim());
-            resolve(Number.isFinite(n) ? Math.round(n) : null);
-        });
-    });
-}
-
-function playWithMpv(source, displayConfig) {
-    const args = [];
-    if (displayConfig && displayConfig.fullscreen) args.push('--fs');
-    if (displayConfig && Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
-    args.push('--af=loudnorm');
-
-    if (isAudioFile(source)) {
-        // Audio-only files need a video stream so the theater display has
-        // something intentional to show. The filter splits mpv's first audio
-        // stream into normal audio output and FFmpeg's showcqt visualizer output.
-        // This deliberately stays local-file-only because a stream URL can
-        // represent video, audio, a playlist, or a protocol where extension
-        // guessing is misleading. mpv should decide how remote sources render.
+async function playWithMpv(source, displayConfig = {}, signal, onUpdate = () => {}) {
+    const args = ['--input-ipc-client=fd://3', '--af=loudnorm', '--alang=eng,en,english'];
+    if (displayConfig.fullscreen) args.push('--fs');
+    if (Number.isInteger(displayConfig.screen)) args.push(`--screen=${displayConfig.screen}`);
+    if (path.isAbsolute(source) && AUDIO_EXTENSIONS.has(path.extname(source).toLowerCase())) {
+        // Preserve the theater's local audio visualizer without guessing the
+        // contents of remote URLs from their extensions.
         args.push('--lavfi-complex=[aid1]asplit[ao][a]; [a]showcqt[vo]');
     }
-
-    // Ask mpv itself to prefer English audio tracks before it applies its normal
-    // fallback behavior. This avoids trying to translate ffprobe stream indexes
-    // into mpv track ids, because mpv already understands the track metadata and
-    // is the final authority on which audio ids can actually be selected.
-    args.push('--alang=eng,en,english');
-
-    args.push(source);
-
-    // mpv normally writes a continuously refreshed status line of its own. The
-    // application now owns the terminal display, so discard that child output
-    // and report playback state through the shared status model instead.
-    const proc = spawn('mpv', args, { stdio: 'ignore' });
-    const done = new Promise((resolve, reject) => {
-        proc.on('error', reject);
-        proc.on('close', (code, signal) => resolve({ code, signal }));
+    args.push('--', source);
+    const { proc, done } = startProcess('mpv', args, {
+        signal, stdio: ['ignore', 'pipe', 'pipe', 'pipe']
     });
-
-    return { proc, done };
-}
-
-function cleanupTempDir(tempDir) {
-    try {
-        for (const name of fs.readdirSync(tempDir)) {
-            const filePath = require('path').join(tempDir, name);
-            try {
-                fs.rmSync(filePath, { recursive: true, force: true });
-            } catch (_) {}
+    const ipc = proc.stdio[3];
+    let buffer = '';
+    let diagnostics = '';
+    let playbackError;
+    let started = false;
+    const properties = {};
+    const capture = (chunk) => { diagnostics = (diagnostics + chunk).slice(-8192); };
+    proc.stdout.on('data', capture);
+    proc.stderr.on('data', capture);
+    ipc.setEncoding('utf8');
+    // An inherited duplex descriptor avoids socket paths and connection polling.
+    ipc.on('error', (error) => { playbackError = `mpv control connection: ${error.message}`; });
+    ipc.on('data', (chunk) => {
+        buffer += chunk;
+        let end;
+        while ((end = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, end);
+            buffer = buffer.slice(end + 1);
+            let message;
+            try { message = JSON.parse(line); } catch (_) { continue; }
+            if (message.event === 'start-file') {
+                started = false;
+                for (const key of Object.keys(properties)) delete properties[key];
+                onUpdate({ started: false, properties: { ...properties } });
+            } else if (message.event === 'property-change') {
+                properties[message.name] = message.data;
+                onUpdate({ started, properties: { ...properties } });
+            } else if (message.event === 'playback-restart') {
+                started = true;
+                onUpdate({ started, properties: { ...properties } });
+            } else if (message.event === 'end-file' && message.reason === 'error') {
+                playbackError = message.file_error || message.error || 'mpv could not play this source';
+            }
         }
-    } catch (_) {}
+    });
+    ['media-title', 'duration', 'time-pos', 'pause', 'paused-for-cache'].forEach((name, id) => {
+        ipc.write(JSON.stringify({ command: ['observe_property', id, name] }) + '\n');
+    });
+    try {
+        const result = await done;
+        if (result.code !== 0 || playbackError) {
+            const detail = diagnostics.trim().split(/\r?\n/).filter(Boolean).slice(-3).join(' ');
+            throw new Error(playbackError || detail || `mpv exited with code ${result.code}`);
+        }
+    } finally {
+        ipc.destroy();
+    }
 }
 
-module.exports = { getDurationSeconds, playWithMpv, cleanupTempDir };
+module.exports = { playWithMpv };
