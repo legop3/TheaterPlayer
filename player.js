@@ -23,6 +23,7 @@ async function main() {
     controller = new PlayerController(config, library, cache, (state) => ui.render(state), (text) => bot?.send(text));
     bot = startTheaterBot(config.bot?.serverUrl, {
         profileImage: config.bot?.profileImage,
+        commandPrefix: config.bot?.commandPrefix,
         onRequest: (query, options) => controller.request(query, options),
         onSkip: () => controller.skip(),
         onServerMode: (mode) => controller.setServerMode(mode),

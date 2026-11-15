@@ -1,23 +1,25 @@
 const { io } = require('socket.io-client');
 
-const HELP = [
-    '!play <search or URL>: Play now, with YouTube fallback.',
-    '!q <search or URL>: Add to the request queue.',
-    '!yt <search>: Play from YouTube.',
-    '!streams: List streams.',
-    '!skip: Skip playback or preparation.',
-    '!now: Show what’s playing and what’s next.',
-    '!info: Show theater status.',
-    '!help: Show commands.'
-].join('\n');
-
 const ALIASES = {
-    '!p': '!play', '!tfind': '!play', '!yt': '!youtube',
-    '!ls': '!streams', '!s': '!skip', '!tskip': '!skip', '!tsk': '!skip',
-    tsk: '!skip', '!h': '!help'
+    p: 'play', tfind: 'play', yt: 'youtube',
+    ls: 'streams', s: 'skip', tskip: 'skip', tsk: 'skip', h: 'help'
 };
 
 function startTheaterBot(serverUrl, handlers = {}) {
+    const prefix = handlers.commandPrefix ?? '!';
+    if (typeof prefix !== 'string' || !prefix.length || /\s/.test(prefix)) {
+        throw new Error('bot.commandPrefix must be a non-empty string without whitespace');
+    }
+    const help = [
+        'play <search or URL>: Play now, with YouTube fallback.',
+        'q <search or URL>: Add to the request queue.',
+        'yt <search>: Play from YouTube.',
+        'streams: List streams.',
+        'skip: Skip playback or preparation.',
+        'now: Show what’s playing and what’s next.',
+        'info: Show theater status.',
+        'help: Show commands.'
+    ].map((line) => prefix + line).join('\n');
     if (!serverUrl) return { send: () => {}, close: () => {} };
     const socket = io(serverUrl, {
         transports: ['websocket', 'polling'], query: { role: 'spectator' }, timeout: 15000
@@ -80,20 +82,22 @@ function startTheaterBot(serverUrl, handlers = {}) {
         if (!ready || message.bot) return;
         const match = String(message.text || '').trim().match(/^(\S+)(?:\s+([\s\S]*))?$/);
         if (!match) return;
-        const command = ALIASES[match[1].toLowerCase()] || match[1].toLowerCase();
+        if (!match[1].startsWith(prefix)) return;
+        const name = match[1].slice(prefix.length).toLowerCase();
+        const command = ALIASES[name] || name;
         const query = (match[2] || '').trim();
         try {
             switch (command) {
-                case '!help': send(HELP); break;
-                case '!streams': send(handlers.onStreams()); break;
-                case '!now': send(handlers.onNow()); break;
-                case '!info': send(handlers.onInfo()); break;
-                case '!skip': send(handlers.onSkip() ? 'Skipping.' : 'Nothing to skip.'); break;
-                case '!play':
-                case '!q':
-                case '!youtube':
-                    if (!query) send(`Usage: ${command} <${command === '!youtube' ? 'search terms' : 'search or URL'}>`);
-                    else handlers.onRequest(query, { next: command === '!q', youtube: command === '!youtube' });
+                case 'help': send(help); break;
+                case 'streams': send(handlers.onStreams()); break;
+                case 'now': send(handlers.onNow()); break;
+                case 'info': send(handlers.onInfo()); break;
+                case 'skip': send(handlers.onSkip() ? 'Skipping.' : 'Nothing to skip.'); break;
+                case 'play':
+                case 'q':
+                case 'youtube':
+                    if (!query) send(`Usage: ${prefix}${command} <${command === 'youtube' ? 'search terms' : 'search or URL'}>`);
+                    else handlers.onRequest(query, { next: command === 'q', youtube: command === 'youtube' });
                     break;
             }
         } catch (error) { send(`Couldn't process command: ${error.message}`); }

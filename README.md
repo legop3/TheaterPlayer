@@ -2,16 +2,29 @@
 An mpv powered automatic media player. Mounts an smb folder and shuffles it's videos one after the other.
 
 ## config
-Livestream aliases can be configured with a top-level `streams` map:
+Copy `config.example.yml` to `config.yml` and adjust the local settings. `config.yml` is ignored by Git.
+
+Set `bot.commandPrefix` to a unique prefix for each theater in the same room (default: `!`):
 
 ```yaml
-streams:
-  kmart channel: "http://stream.vrcdn.live/live/dmtz.live.ts"
+bot:
+  commandPrefix: "!theater1"
+```
+
+This example uses `!theater1play`, `!theater1skip`, and `!theater1help`.
+Prefixes must be non-empty and contain no whitespace. All commands and aliases require the prefix.
+
+Livestream aliases are maintained separately in the tracked `streams.yml` file as a name-to-URL map:
+
+```yaml
+kmart channel: "http://stream.vrcdn.live/live/dmtz.live.ts"
 ```
 
 ## chat commands
+These examples use the default `!` prefix.
+
 - `!help` shows the available commands.
-- `!skip`, `!tskip`, `tsk`, or `!tsk` skips the current item.
+- `!skip`, `!tskip`, or `!tsk` skips the current item.
 - `!play <url, stream alias, or search text>` plays a direct mpv-supported URL, fuzzy matches configured stream aliases, then fuzzy searches SMB files.
 - `!now` shows the current item, status, and progress.
 - `!info` shows status, library count, queue count, configured stream count, and the current item.
