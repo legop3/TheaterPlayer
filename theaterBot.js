@@ -63,7 +63,7 @@ function startTheaterBot(serverUrl, handlers = {}) {
     }
     socket.on('connect', async () => {
         try {
-            await emitAck('nickname:set', { nickname: 'Theater' });
+            await emitAck('nickname:set', { nickname: handlers.nickname ?? 'Theater' });
             await emitAck('session:setRole', { role: 'spectator' });
             ready = socket.connected;
         } catch (error) { console.error('theater bot handshake:', error.message); }

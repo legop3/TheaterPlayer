@@ -22,6 +22,7 @@ async function main() {
     const ui = createTerminalUi(shutdown);
     controller = new PlayerController(config, library, cache, (state) => ui.render(state), (text) => bot?.send(text));
     bot = startTheaterBot(config.bot?.serverUrl, {
+        nickname: config.bot?.nickname,
         profileImage: config.bot?.profileImage,
         commandPrefix: config.bot?.commandPrefix,
         onRequest: (query, options) => controller.request(query, options),

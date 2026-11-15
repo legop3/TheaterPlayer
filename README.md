@@ -8,8 +8,11 @@ Set `bot.commandPrefix` to a unique prefix for each theater in the same room (de
 
 ```yaml
 bot:
+  nickname: "Theater 1"
   commandPrefix: "!theater1"
 ```
+
+`bot.nickname` sets the bot’s chat name (default: `Theater`).
 
 This example uses `!theater1play`, `!theater1skip`, and `!theater1help`.
 Prefixes must be non-empty and contain no whitespace. All commands and aliases require the prefix.
